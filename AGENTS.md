@@ -1,4 +1,4 @@
-# NTrace-core 项目记忆文件（2026-02 快照，rev-2）
+# NTrace-core 项目记忆文件（2026-03 快照，rev-3）
 
 # 供 LLM 在后续会话中快速加载上下文，减少重复分析。
 
@@ -29,6 +29,52 @@
 
 - `--table`：现在是"最终汇总表"模式（一次探测完成后输出汇总表），不再是旧的异步 table 刷新模式。
 - `--route-path`：仍由 `reporter.New(...).Print()` 负责（与 MTR report 无关）。
+
+### 独立 `--mtu` 路径
+
+- `--mtu`：独立 UDP path-MTU / tracepath 风格模式，不复用普通 `trace.Traceroute` / MTR / Web 路径。
+- flavor 可用性：仅 `nexttrace` / `nexttrace-tiny` 包含；`ntr` 不注册该 flag。
+- 输出：
+  - `TTY`：当前 TTL 占位后原地更新，边探测边刷行。
+  - `非 TTY`：TTL 定稿后逐行流式输出，不使用 renderer 自己的 ANSI 控制序列。
+  - `--json`：输出独立 mtu schema；`hop.geo` 已存在。
+- 参数语义：
+  - 复用 `--data-provider`、`--language`、`--no-rdns`、`--always-rdns`、`--dot-server`。
+  - `--mtu` 仍只支持 UDP；显式 `--tcp` 冲突报错。
+- Geo/RDNS：
+  - `trace/mtu` 自带独立 metadata helper，不依赖普通 `trace.Hop.fetchIPData`。
+  - 流式事件会先输出基础 hop，再在同一 TTL 内补一条带 Geo/RDNS 的 update，最后 `ttl_final` 定稿。
+  - macOS 上曾有 `Warning: macOS --mtu support is experimental.` 提示，现已删除；不要再假设 CLI 会打印这句。
+
+### `--psize` / `--tos` 语义与平台差异
+
+- `--psize` 现在统一对齐 `mtr -s/--psize`：
+  - 用户输入语义是“含 IP + 当前探测协议头的总字节数”。
+  - 内部 `trace.Config.PktSize` 仍保存 payload bytes。
+  - 未显式传入时，不再固定默认 `52`，而是按协议/IP 族自动取最小合法值：
+    - ICMPv4 / UDPv4 = `28`
+    - TCPv4 = `44`
+    - ICMPv6 = `48`
+    - UDPv6 = `50`
+    - TCPv6 = `64`
+  - 负数 `--psize` 表示“每个 probe 独立随机”，CLI 允许 `--psize -84` 这种写法并会在解析前归一化。
+- `--tos` / `-Q`：
+  - 范围固定 `0..255`。
+  - `--mtu` 与 Globalping 显式传 `--psize` / `--tos` 会直接报不支持。
+- 平台发送路径差异（这是后续判断 bug 的关键记忆）：
+  - Linux / 其他 Unix：
+    - `ICMP/TCP/UDP` 的 IPv4/IPv6 都走原生 socket/raw socket 路径。
+    - `--tos` 只是在现有路径上设置 `TOS/TrafficClass`，不会切换实现。
+  - macOS：
+    - 与 Linux 类似，`ICMP/TCP/UDP` 的 IPv4/IPv6 都走原生发送路径。
+    - `--tos` 同样只是在现有路径上设置 `TOS/TrafficClass`。
+  - Windows：
+    - `TCP/UDP` 的 IPv4/IPv6 一直走 WinDivert raw send。
+    - `ICMPv4` 一直走 socket path（`SetTOS` / `SetTTL`）。
+    - `ICMPv6`：
+      - 默认或 `--tos 0`：继续走原生 socket path，只设置 `HopLimit`，保持与 `v1.5.2` 一致。
+      - 非零 `--tos`：切到 WinDivert raw send，直接发送完整 `IPv6 + ICMPv6` 报文，因为 Windows 的 `x/net/ipv6.PacketConn` 不能可靠设置 `TrafficClass`。
+    - 因此，Windows 上只有“`ICMPv6` 且 `--tos != 0`”这个组合会额外依赖 WinDivert 发送能力；README 中英两份都已写明。
 
 ### 间隔默认值（分层体系）
 

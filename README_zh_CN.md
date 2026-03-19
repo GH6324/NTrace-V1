@@ -159,6 +159,7 @@ Document Language: [English](README.md) | 简体中文
 | 功能                    | `nexttrace`（完整版） | `nexttrace-tiny` |   `ntr`    |
 | ----------------------- | :-------------------: | :--------------: | :--------: |
 | 常规 traceroute         |          ✅           |        ✅        |     —      |
+| 独立 MTU（`--mtu`）     |          ✅           |        ✅        |     —      |
 | MTR TUI                 |          ✅           |        —         | ✅（默认） |
 | MTR 报告（`-r`）        |          ✅           |        —         |     ✅     |
 | MTR 宽报告（`-w`）      |          ✅           |        —         |     ✅     |
@@ -175,7 +176,7 @@ Document Language: [English](README.md) | 简体中文
 
 - **`nexttrace`** — 完整版。包含所有功能：traceroute、MTR、Globalping 与 WebUI。
 - **`nexttrace-tiny`** — 精简版。仅保留常规 traceroute，不含 MTR / Globalping / WebUI。适合嵌入式或极简环境。
-- **`ntr`** — MTR 专用版。默认启动 MTR TUI。无 Globalping / WebUI，无常规 traceroute 模式。
+- **`ntr`** — MTR 专用版。默认启动 MTR TUI。无 Globalping / WebUI，无常规 traceroute 模式，也不带独立 `--mtu` 模式。
 
 ### 手动编译
 
@@ -238,9 +239,15 @@ nexttrace http://example.com:8080/index.html?q=1
 # 表格输出（报告模式）：运行一次探测后打印最终汇总表格
 nexttrace --table 1.0.0.1
 
-# 一个方便供机器读取转化的模式
+# 机器可读输出：stdout 只包含一个 JSON 文档
 nexttrace --raw 1.0.0.1
 nexttrace --json 1.0.0.1
+
+# 将实时 traceroute 输出写入自定义文件
+nexttrace --output ./trace.log 1.0.0.1
+
+# 将实时 traceroute 输出写入默认日志文件
+nexttrace --output-default 1.0.0.1
 
 # 只进行IPv4/IPv6解析，且当多个IP时自动选择第一个IP
 nexttrace --ipv4 g.co
@@ -275,6 +282,7 @@ PS: 路由可视化的绘制模块为独立模块，具体代码可在 [nxtrace/
 - 对于管理员模式：  
   **TCP/UDP mode** 依赖 `WinDivert`。  
   **ICMP mode** 支持 `1=Socket` 与 `2=WinDivert`（`0=Auto`）。使用 Socket 模式时，需防火墙配置允许`ICMP/ICMPv6`。  
+  在 `Windows` 上，`ICMPv6` 未传 `--tos` 或显式 `--tos 0` 时继续走原生 Socket 发送路径；只有非零 `ICMPv6 --tos` 才额外依赖 `WinDivert` 发送能力，并要求管理员权限。  
   `WinDivert` 可使用 `--init` 参数自动配置环境。
 
 #### `NextTrace` 现已经支持快速测试，有一次性测试回程路由需求的朋友可以使用
@@ -330,6 +338,24 @@ nexttrace --udp --port 5353 1.0.0.1
 nexttrace --tcp --source-port 14514 www.bing.com
 ```
 
+#### `NextTrace` 也支持独立的路径 MTU 探测模式
+
+```bash
+# 类 tracepath 的 UDP PMTU 探测，运行中实时刷行
+nexttrace --mtu 1.1.1.1
+
+# mtu 模式同样复用常规的 GeoIP / RDNS 参数
+nexttrace --mtu --data-provider IPInfo --language en 1.1.1.1
+
+# JSON 输出沿用独立 mtu schema，并包含 hop.geo
+nexttrace --mtu --json 1.1.1.1
+```
+
+- `--mtu` 是独立的 UDP-only 模式，不复用普通 traceroute 引擎。
+- TTY 下会原地更新当前 hop，并为 hop 状态 / PMTU 高亮加色；重定向/管道输出会退化成“定稿一跳输出一行”的无 ANSI 流式文本。
+- `--mtu --json` 在 stdout 上只输出独立的 MTU JSON 文档。
+- GeoIP、RDNS、`--data-provider`、`--language`、`--no-rdns`、`--always-rdns`、`--dot-server` 都对该模式生效。
+
 #### `NextTrace`也同样支持一些进阶功能，如 TTL 控制、并发数控制、模式切换等
 
 ```bash
@@ -347,8 +373,14 @@ export NEXTTRACE_ENABLEHIDDENDSTIP=1
 # 关闭IP反向解析功能
 nexttrace --no-rdns www.bbix.net
 
-# 设置载荷大小为1024字节
+# 设置探测包总大小为1024字节（含 IP + 探测协议头）
 nexttrace --psize 1024 example.com
+
+# 让每个 probe 在 1500 字节内随机大小
+nexttrace --psize -1500 example.com
+
+# 设置 TOS / traffic class 字段
+nexttrace -Q 46 example.com
 
 # 特色功能：打印Route-Path图
 # Route-Path图示例：
@@ -376,7 +408,8 @@ export NO_COLOR=1
 | `--send-time` | 同一 TTL 组内相邻探测包间隔 | `50ms` | 设备限速时升到 `100-200ms`；MTR 下忽略 |
 | `--ttl-time` | 常规 traceroute 的 TTL 组间隔；MTR 的每跳探测间隔 | traceroute: `300ms`；MTR: 未指定时 `1000ms` | 想加速就调低；远程/限速链路调高 |
 | `--timeout` | 单个探测包超时 | `1000ms` | 跨洲或高丢包链路升到 `2000-3000ms` |
-| `--psize` | 载荷大小 | `52` 字节 | 只在 MTU 或大包探测时增大 |
+| `--psize` | 探测包大小 | 按协议/IP 族自动取最小合法值 | 含 IP + 探测协议头；负值表示每个 probe 在 `abs(value)` 内随机；超过出接口/路径 MTU 时，链路上可能看到分片 |
+| `-Q`, `--tos` | IP TOS / traffic class | `0` | 设置 IP 头里的 TOS / traffic class；在 Windows 上仅 `ICMPv6` 且值非零时额外依赖 `WinDivert` |
 
 这些探测参数目前仍是 CLI 级配置，`nt_config.yaml` 还不能直接保存它们。若要复用一组调优参数，建议写成 shell alias 或小脚本。
 
@@ -493,7 +526,7 @@ wide 报告模式（`-w` / `--wide`）继续保留当前完整信息行为，包
 
 > 注意：`--show-ips` 仅在 MTR 模式（`--mtr`、`-r`、`-w`）生效，其他模式会忽略。
 >
-> 注意：`--mtr` 不可与 `--table`、`--classic`、`--json`、`--output`、`--route-path`、`--from`、`--fast-trace`、`--file`、`--deploy` 同时使用。
+> 注意：`--mtr` 不可与 `--table`、`--classic`、`--json`、`--output`、`--output-default`、`--route-path`、`--from`、`--fast-trace`、`--file`、`--deploy` 同时使用。
 
 #### `NextTrace`支持用户自主选择 IP 数据库（目前支持：`LeoMoeAPI`, `IP.SB`, `IPInfo`, `IPInsight`, `IPAPI.com`, `IPInfoLocal`, `CHUNZHEN`)
 
@@ -606,9 +639,10 @@ Usage: nexttrace [-h|--help] [--init] [-4|--ipv4] [-6|--ipv6] [-T|--tcp]
                  [-m|--max-hops <integer>] [-d|--data-provider
                  (IP.SB|ip.sb|IPInfo|ipinfo|IPInsight|ipinsight|IPAPI.com|ip-api.com|IPInfoLocal|ipinfolocal|chunzhen|LeoMoeAPI|leomoeapi|ipdb.one|disable-geoip)]
                  [--pow-provider (api.nxtrace.org|sakura)] [-n|--no-rdns]
-                 [-a|--always-rdns] [-P|--route-path] [--dn42] [-o|--output]
-                 [--table] [--raw] [-j|--json] [-c|--classic] [-f|--first
-                 <integer>] [-M|--map] [-e|--disable-mpls] [-V|--version]
+                 [-a|--always-rdns] [-P|--route-path] [--dn42] [-o|--output
+                 "<value>"] [-O|--output-default] [--table] [--raw]
+                 [-j|--json] [-c|--classic] [-f|--first <integer>] [-M|--map]
+                 [-e|--disable-mpls] [-V|--version]
                  [-s|--source "<value>"] [--source-port <integer>] [-D|--dev
                  "<value>"] [--listen "<value>"] [--deploy] [-z|--send-time
                  <integer>] [-i|--ttl-time <integer>] [--timeout <integer>]
@@ -662,8 +696,10 @@ Arguments:
   -P  --route-path                   Print traceroute hop path by ASN and
                                      location
       --dn42                         DN42 Mode
-  -o  --output                       Write trace result to file
-                                     (RealTimePrinter ONLY)
+  -o  --output                       Write trace result to FILE
+                                     (RealtimePrinter only)
+  -O  --output-default               Write trace result to the default log file
+                                     (/tmp/trace.log)
       --table                        Output trace results as a final summary
                                      table (traceroute report mode)
       --raw                          Machine-friendly output. With MTR
@@ -698,9 +734,14 @@ Arguments:
       --timeout                      Per-probe timeout [ms]. Raise to 2000-3000
                                      on slow intercontinental or high-loss
                                      paths. Default: 1000
-      --psize                        Payload size in bytes. Keep 52 for normal
-                                     routing checks; raise only for MTU or
-                                     large-packet testing. Default: 52
+      --psize                        Probe packet size in bytes, inclusive IP
+                                     and active probe headers. Default is the
+                                     minimum legal size for the chosen
+                                     protocol and IP family; raise for MTU or
+                                     large-packet testing. Negative values
+                                     randomize each probe up to abs(value).
+  -Q  --tos                          Set the IP type-of-service / traffic class
+                                     value [0-255]. Default: 0
       --dot-server                   Use DoT Server for DNS Parse [dnssb,
                                      aliyun, dnspod, google, cloudflare]
   -g  --language                     Choose the language for displaying [en,

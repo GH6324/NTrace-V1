@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -16,6 +17,10 @@ import (
 )
 
 func handleGlobalpingTrace(opts *trace.GlobalpingOptions, config *trace.Config) {
+	ctx := context.Background()
+	if config != nil && config.Context != nil {
+		ctx = config.Context
+	}
 	res, measurement, err := trace.GlobalpingTraceroute(opts, config)
 	if err != nil {
 		fmt.Println(err)
@@ -29,7 +34,7 @@ func handleGlobalpingTrace(opts *trace.GlobalpingOptions, config *trace.Config) 
 			fmt.Println(err)
 			return
 		}
-		url, err := tracemap.GetMapUrl(string(r))
+		url, err := tracemap.GetMapUrlWithContext(ctx, string(r))
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -55,7 +60,7 @@ func handleGlobalpingTrace(opts *trace.GlobalpingOptions, config *trace.Config) 
 	fmt.Fprintln(color.Output, color.New(color.FgGreen, color.Bold).Sprintf("> %s", trace.GlobalpingFormatLocation(&measurement.Results[0])))
 
 	if opts.TablePrint {
-		printer.TracerouteTablePrinter(res)
+		printer.TracerouteTablePrinter(res, opts.ClearScreen)
 	} else {
 		for i := range res.Hops {
 			if opts.ClassicPrint {

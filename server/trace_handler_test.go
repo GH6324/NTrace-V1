@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +17,7 @@ import (
 )
 
 func TestPrepareTrace_DoesNotForceLegacyInterval(t *testing.T) {
-	setup, statusCode, err := prepareTrace(traceRequest{
+	setup, statusCode, err := prepareTrace(context.Background(), traceRequest{
 		Target:       "1.1.1.1",
 		Mode:         "mtr",
 		DataProvider: "disable-geoip",
@@ -44,11 +45,18 @@ func TestResolveWebMTRHopInterval_PrefersHopIntervalMs(t *testing.T) {
 }
 
 func TestBuildTraceConfig_PropagatesSessionScopedFields(t *testing.T) {
-	cfg := buildTraceConfig(traceRequest{
+	packetSize := 52
+	tos := 0
+	cfg, err := buildTraceConfig(traceRequest{
 		SourceDevice: "en7",
 		DisableMPLS:  true,
 		DotServer:    "cloudflare",
-	}, net.ParseIP("1.1.1.1"), "IPInfo", 80)
+		PacketSize:   &packetSize,
+		TOS:          &tos,
+	}, trace.ICMPTrace, net.ParseIP("1.1.1.1"), "IPInfo", 80)
+	if err != nil {
+		t.Fatalf("buildTraceConfig returned error: %v", err)
+	}
 
 	if cfg.SourceDevice != "en7" {
 		t.Fatalf("buildTraceConfig SourceDevice = %q, want en7", cfg.SourceDevice)
@@ -59,10 +67,55 @@ func TestBuildTraceConfig_PropagatesSessionScopedFields(t *testing.T) {
 	if cfg.IPGeoSource == nil {
 		t.Fatal("buildTraceConfig IPGeoSource = nil, want wrapped source")
 	}
+	if cfg.TOS != 0 {
+		t.Fatalf("buildTraceConfig TOS = %d, want 0", cfg.TOS)
+	}
+}
+
+func TestBuildTraceConfig_PreservesNegativePacketSizeAndTOS(t *testing.T) {
+	packetSize := -123
+	tos := 255
+	cfg, err := buildTraceConfig(traceRequest{
+		PacketSize: &packetSize,
+		TOS:        &tos,
+	}, trace.ICMPTrace, net.ParseIP("1.1.1.1"), "disable-geoip", 80)
+	if err != nil {
+		t.Fatalf("buildTraceConfig returned error: %v", err)
+	}
+	if !cfg.RandomPacketSize {
+		t.Fatal("buildTraceConfig RandomPacketSize = false, want true")
+	}
+	if cfg.TOS != 255 {
+		t.Fatalf("buildTraceConfig TOS = %d, want 255", cfg.TOS)
+	}
+}
+
+func TestBuildTraceConfig_DefaultsPacketSizeByProtocolAndFamily(t *testing.T) {
+	cfg, err := buildTraceConfig(traceRequest{}, trace.TCPTrace, net.ParseIP("2a00:1450:4009:81a::200e"), "disable-geoip", 80)
+	if err != nil {
+		t.Fatalf("buildTraceConfig returned error: %v", err)
+	}
+	if cfg.PktSize != 0 {
+		t.Fatalf("buildTraceConfig PktSize = %d, want 0 payload bytes for default TCP/IPv6 minimum", cfg.PktSize)
+	}
+	if cfg.RandomPacketSize {
+		t.Fatal("buildTraceConfig RandomPacketSize = true, want false")
+	}
+}
+
+func TestNormalizeTraceRequest_RejectsInvalidTOS(t *testing.T) {
+	tos := 256
+	statusCode, err := normalizeTraceRequest(&traceRequest{TOS: &tos})
+	if err == nil {
+		t.Fatal("normalizeTraceRequest should reject invalid tos")
+	}
+	if statusCode != http.StatusBadRequest {
+		t.Fatalf("statusCode = %d, want %d", statusCode, http.StatusBadRequest)
+	}
 }
 
 func TestPrepareTrace_RejectsUnknownSourceDevice(t *testing.T) {
-	_, statusCode, err := prepareTrace(traceRequest{
+	_, statusCode, err := prepareTrace(context.Background(), traceRequest{
 		Target:       "1.1.1.1",
 		DataProvider: "disable-geoip",
 		SourceDevice: "codex-nonexistent-dev0",
@@ -218,8 +271,11 @@ func TestTraceMapURLForResult_UsesRequestScopedMapHelper(t *testing.T) {
 		}
 		return callback()
 	}
-	traceMapURLFn = func(payload string) (string, error) {
+	traceMapURLFn = func(ctx context.Context, payload string) (string, error) {
 		traceMapCalled = true
+		if ctx == nil {
+			t.Fatal("context should not be nil")
+		}
 		if payload == "" {
 			t.Fatal("payload should not be empty")
 		}
@@ -242,5 +298,29 @@ func TestTraceMapURLForResult_UsesRequestScopedMapHelper(t *testing.T) {
 	}
 	if !traceMapCalled {
 		t.Fatal("expected traceMapURLFn to be called")
+	}
+}
+
+func TestPrepareTraceHonorsCanceledContext(t *testing.T) {
+	oldLookup := traceDomainLookupFn
+	traceDomainLookupFn = func(ctx context.Context, target, ipVersion, dotServer string, disableOutput bool) (net.IP, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	defer func() { traceDomainLookupFn = oldLookup }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	_, _, err := prepareTrace(ctx, traceRequest{
+		Target:       "example.com",
+		DataProvider: "disable-geoip",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepareTrace error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("prepareTrace returned too slowly after cancel: %v", elapsed)
 	}
 }

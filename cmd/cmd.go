@@ -5,17 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/akamensky/argparse"
 	"github.com/fatih/color"
-	"github.com/syndtr/gocapability/capability"
 
 	"github.com/nxtrace/NTrace-core/assets/windivert"
 	"github.com/nxtrace/NTrace-core/config"
@@ -42,6 +44,10 @@ type listenInfo struct {
 const (
 	defaultPacketIntervalMs        = 50
 	defaultTracerouteTTLIntervalMs = 300
+)
+
+var (
+	domainLookupFn = util.DomainLookUpWithContext
 )
 
 func normalizeListenAddr(addr string) string {
@@ -117,6 +123,32 @@ func isDigitsOnly(s string) bool {
 		}
 	}
 	return true
+}
+
+func normalizeNegativePacketSizeArgs(args []string) []string {
+	if len(args) < 3 {
+		return args
+	}
+
+	normalized := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		cur := args[i]
+		if cur == "--psize" && i+1 < len(args) && isNegativeInteger(args[i+1]) {
+			normalized = append(normalized, "--psize="+args[i+1])
+			i++
+			continue
+		}
+		normalized = append(normalized, cur)
+	}
+	return normalized
+}
+
+func isNegativeInteger(s string) bool {
+	if !strings.HasPrefix(s, "-") || len(s) < 2 {
+		return false
+	}
+	v, err := strconv.Atoi(s)
+	return err == nil && v < 0
 }
 
 func guessLocalIPv4() string {
@@ -260,11 +292,12 @@ type effectiveMTRModes struct {
 }
 
 type tracerouteOutputFlags struct {
-	routePath    *bool
-	output       *bool
-	tablePrint   *bool
-	jsonPrint    *bool
-	classicPrint *bool
+	routePath     *bool
+	outputPath    *string
+	outputDefault *bool
+	tablePrint    *bool
+	jsonPrint     *bool
+	classicPrint  *bool
 }
 
 type webUIFlags struct {
@@ -290,6 +323,13 @@ func registerInitFlag(parser *argparse.Parser) *bool {
 func registerFastTraceFlag(parser *argparse.Parser) *bool {
 	if !defaultMTR {
 		return parser.Flag("F", "fast-trace", &argparse.Options{Help: "One-Key Fast Trace to China ISPs"})
+	}
+	return ptrBool(false)
+}
+
+func registerMTUFlag(parser *argparse.Parser) *bool {
+	if enableMTU {
+		return parser.Flag("", "mtu", &argparse.Options{Help: "Run standalone UDP path-MTU discovery mode with streaming output and GeoIP/RDNS"})
 	}
 	return ptrBool(false)
 }
@@ -329,25 +369,31 @@ func buildTimeoutHelp() string {
 }
 
 func buildPayloadSizeHelp() string {
-	return "Payload size in bytes. Keep 52 for normal routing checks; raise only for MTU or large-packet testing"
+	return "Probe packet size in bytes, inclusive IP and active probe headers. Default is the minimum legal size for the chosen protocol and IP family; raise for MTU or large-packet testing. Negative values randomize each probe up to abs(value)"
+}
+
+func buildTOSHelp() string {
+	return "Set the IP type-of-service / traffic class value [0-255]"
 }
 
 func registerTracerouteOutputFlags(parser *argparse.Parser) tracerouteOutputFlags {
 	if !defaultMTR {
 		return tracerouteOutputFlags{
-			routePath:    parser.Flag("P", "route-path", &argparse.Options{Help: "Print traceroute hop path by ASN and location"}),
-			output:       parser.Flag("o", "output", &argparse.Options{Help: "Write trace result to file (RealTimePrinter ONLY)"}),
-			tablePrint:   parser.Flag("", "table", &argparse.Options{Help: "Output trace results as a final summary table (traceroute report mode)"}),
-			jsonPrint:    parser.Flag("j", "json", &argparse.Options{Help: "Output trace results as JSON"}),
-			classicPrint: parser.Flag("c", "classic", &argparse.Options{Help: "Classic Output trace results like BestTrace"}),
+			routePath:     parser.Flag("P", "route-path", &argparse.Options{Help: "Print traceroute hop path by ASN and location"}),
+			outputPath:    parser.String("o", "output", &argparse.Options{Help: "Write trace result to FILE (RealtimePrinter only)"}),
+			outputDefault: parser.Flag("O", "output-default", &argparse.Options{Help: "Write trace result to the default log file (/tmp/trace.log)"}),
+			tablePrint:    parser.Flag("", "table", &argparse.Options{Help: "Output trace results as a final summary table (traceroute report mode)"}),
+			jsonPrint:     parser.Flag("j", "json", &argparse.Options{Help: "Output trace results as JSON"}),
+			classicPrint:  parser.Flag("c", "classic", &argparse.Options{Help: "Classic Output trace results like BestTrace"}),
 		}
 	}
 	return tracerouteOutputFlags{
-		routePath:    ptrBool(false),
-		output:       ptrBool(false),
-		tablePrint:   ptrBool(false),
-		jsonPrint:    ptrBool(false),
-		classicPrint: ptrBool(false),
+		routePath:     ptrBool(false),
+		outputPath:    ptrStr(""),
+		outputDefault: ptrBool(false),
+		tablePrint:    ptrBool(false),
+		jsonPrint:     ptrBool(false),
+		classicPrint:  ptrBool(false),
 	}
 }
 
@@ -474,7 +520,7 @@ func deriveEffectiveMTRModes(mtrMode, reportMode, wideMode, rawPrint bool) effec
 	}
 }
 
-func detectExplicitProbeFlags(parser *argparse.Parser) (queriesExplicit, ttlTimeExplicit bool) {
+func detectExplicitProbeFlags(parser *argparse.Parser) (queriesExplicit, ttlTimeExplicit, packetSizeExplicit, tosExplicit bool) {
 	for _, a := range parser.GetArgs() {
 		if !a.GetParsed() {
 			continue
@@ -484,13 +530,28 @@ func detectExplicitProbeFlags(parser *argparse.Parser) (queriesExplicit, ttlTime
 			queriesExplicit = true
 		case "ttl-time":
 			ttlTimeExplicit = true
+		case "psize":
+			packetSizeExplicit = true
+		case "tos":
+			tosExplicit = true
 		}
 	}
-	return queriesExplicit, ttlTimeExplicit
+	return queriesExplicit, ttlTimeExplicit, packetSizeExplicit, tosExplicit
+}
+
+func resolvePacketSizeArg(packetSize int, explicit bool, method trace.Method, dstIP net.IP) int {
+	if explicit {
+		return packetSize
+	}
+	return trace.DefaultPacketSize(method, dstIP)
 }
 
 func applyColorMode(noColor bool) {
 	color.NoColor = noColor
+}
+
+func shouldForceNoColorForMTUNonTTY(mtuMode, jsonPrint, stdoutIsTTY bool) bool {
+	return mtuMode && !jsonPrint && !stdoutIsTTY
 }
 
 func printStartupBanner(jsonPrint bool, effectiveMTR bool) {
@@ -624,13 +685,13 @@ func resolveTraceMethod(tcp, udp bool) trace.Method {
 	}
 }
 
-func maybeRunFastTraceMode(from string, fastTraceFlag bool, file string, params fastTrace.ParamsFastTrace, method trace.Method, output bool) bool {
+func maybeRunFastTraceMode(from string, fastTraceFlag bool, file string, params fastTrace.ParamsFastTrace, method trace.Method) bool {
 	if from != "" || (!fastTraceFlag && file == "") {
 		return false
 	}
-	fastTrace.FastTest(method, output, params)
-	if output {
-		fmt.Println("您的追踪日志已经存放在 /tmp/trace.log 中")
+	fastTrace.FastTest(method, params)
+	if params.OutputPath != "" {
+		fmt.Printf("您的追踪日志已经存放在 %s 中\n", params.OutputPath)
 	}
 	os.Exit(0)
 	return true
@@ -691,16 +752,13 @@ func applyDN42Mode(enabled bool, dataOrigin *string, disableMaptrace *bool) {
 	*disableMaptrace = true
 }
 
-func prepareRuntimeEnvironment(modes effectiveMTRModes, dn42 bool, dataOrigin *string, disableMaptrace *bool, powProvider *string) *wshandle.WsConn {
+func prepareRuntimeEnvironment(ctx context.Context, dn42 bool, dataOrigin *string, disableMaptrace *bool, powProvider *string) *wshandle.WsConn {
 	capabilitiesCheck()
 	applyDN42Mode(dn42, dataOrigin, disableMaptrace)
-	if modes.mtr {
-		util.SuppressFastIPOutput = true
-	}
-	return initLeoWebsocket(dataOrigin, powProvider)
+	return initLeoWebsocket(ctx, dataOrigin, powProvider)
 }
 
-func initLeoWebsocket(dataOrigin, powProvider *string) *wshandle.WsConn {
+func initLeoWebsocket(ctx context.Context, dataOrigin, powProvider *string) *wshandle.WsConn {
 	if !strings.EqualFold(*dataOrigin, "LEOMOEAPI") {
 		return nil
 	}
@@ -714,7 +772,7 @@ func initLeoWebsocket(dataOrigin, powProvider *string) *wshandle.WsConn {
 		return nil
 	}
 
-	leoWs := wshandle.New()
+	leoWs := wshandle.NewWithContext(ctx)
 	if leoWs != nil {
 		leoWs.Interrupt = make(chan os.Signal, 1)
 		signal.Notify(leoWs.Interrupt, os.Interrupt)
@@ -723,8 +781,8 @@ func initLeoWebsocket(dataOrigin, powProvider *string) *wshandle.WsConn {
 }
 
 func closeLeoWebsocket(leoWs *wshandle.WsConn) {
-	if leoWs != nil && leoWs.Conn != nil {
-		_ = leoWs.Conn.Close()
+	if leoWs != nil {
+		leoWs.Close()
 	}
 }
 
@@ -736,19 +794,19 @@ func maybeHandleGlobalping(from string, opts *trace.GlobalpingOptions, conf *tra
 	return true
 }
 
-func lookupTargetIP(domain string, ipv4Only, ipv6Only bool, dot string, jsonPrint bool) (net.IP, error) {
+func lookupTargetIP(ctx context.Context, domain string, ipv4Only, ipv6Only bool, dot string, jsonPrint bool) (net.IP, error) {
 	switch {
 	case ipv6Only:
-		return util.DomainLookUp(domain, "6", dot, jsonPrint)
+		return domainLookupFn(ctx, domain, "6", dot, jsonPrint)
 	case ipv4Only:
-		return util.DomainLookUp(domain, "4", dot, jsonPrint)
+		return domainLookupFn(ctx, domain, "4", dot, jsonPrint)
 	default:
-		return util.DomainLookUp(domain, "all", dot, jsonPrint)
+		return domainLookupFn(ctx, domain, "all", dot, jsonPrint)
 	}
 }
 
-func lookupTargetIPOrExit(domain string, ipv4Only, ipv6Only bool, dot string, jsonPrint bool) net.IP {
-	ip, err := lookupTargetIP(domain, ipv4Only, ipv6Only, dot, jsonPrint)
+func lookupTargetIPOrExit(ctx context.Context, domain string, ipv4Only, ipv6Only bool, dot string, jsonPrint bool) net.IP {
+	ip, err := lookupTargetIP(ctx, domain, ipv4Only, ipv6Only, dot, jsonPrint)
 	if err != nil {
 		if util.EnvDevMode {
 			panic(err)
@@ -758,20 +816,27 @@ func lookupTargetIPOrExit(domain string, ipv4Only, ipv6Only bool, dot string, js
 	return ip
 }
 
-func applySourceDevice(srcDev string, dstIP net.IP, srcAddr *string) {
-	if srcDev == "" {
-		return
+func resolveSourceDevice(srcDev string) (*net.Interface, error) {
+	trimmed := strings.TrimSpace(srcDev)
+	if trimmed == "" {
+		return nil, nil
 	}
-	dev, devErr := net.InterfaceByName(srcDev)
-	if devErr != nil || dev == nil {
-		fmt.Printf("无法找到网卡 %q: %v\n", srcDev, devErr)
-		os.Exit(1)
+	dev, err := net.InterfaceByName(trimmed)
+	if err != nil || dev == nil {
+		return nil, fmt.Errorf("无法找到网卡 %q: %v", trimmed, err)
 	}
-	util.SrcDev = dev.Name
+	return dev, nil
+}
+
+func resolveSourceDeviceAddr(dev *net.Interface, dstIP net.IP) string {
+	if dev == nil || dstIP == nil {
+		return ""
+	}
 	addrs, err := dev.Addrs()
 	if err != nil {
-		return
+		return ""
 	}
+	var candidate string
 	for _, addr := range addrs {
 		ipNet, ok := addr.(*net.IPNet)
 		if !ok {
@@ -780,23 +845,66 @@ func applySourceDevice(srcDev string, dstIP net.IP, srcAddr *string) {
 		if (ipNet.IP.To4() == nil) != (dstIP.To4() == nil) {
 			continue
 		}
-		*srcAddr = ipNet.IP.String()
-		parsed := net.ParseIP(*srcAddr)
+		candidate = ipNet.IP.String()
+		parsed := net.ParseIP(candidate)
 		if parsed != nil && !(parsed.IsPrivate() ||
 			parsed.IsLoopback() ||
 			parsed.IsLinkLocalUnicast() ||
 			parsed.IsLinkLocalMulticast()) {
-			break
+			return candidate
 		}
 	}
+	return candidate
 }
 
-func normalizeUDPPacketSize(udp bool, ip net.IP, packetSize *int) {
-	if !udp || !util.IsIPv6(ip) || *packetSize >= 2 {
+func resolveFallbackSrcAddr(dstIP net.IP) string {
+	if dstIP == nil {
+		return ""
+	}
+	if util.IsIPv6(dstIP) {
+		resolved, _ := util.LocalIPPortv6(dstIP, nil, "udp6")
+		if resolved != nil {
+			return resolved.String()
+		}
+		return ""
+	}
+	resolved, _ := util.LocalIPPort(dstIP, nil, "udp")
+	if resolved != nil {
+		return resolved.String()
+	}
+	return ""
+}
+
+func resolveConfiguredSrcAddr(dstIP net.IP, srcAddr, srcDev string) (resolved string, explicit bool, err error) {
+	if trimmed := strings.TrimSpace(srcAddr); trimmed != "" {
+		return trimmed, true, nil
+	}
+	dev, err := resolveSourceDevice(srcDev)
+	if err != nil {
+		return "", false, err
+	}
+	if resolved := resolveSourceDeviceAddr(dev, dstIP); resolved != "" {
+		return resolved, false, nil
+	}
+	return resolveFallbackSrcAddr(dstIP), false, nil
+}
+
+func applySourceDevice(srcDev string, dstIP net.IP, srcAddr *string) {
+	dev, err := resolveSourceDevice(srcDev)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	if dev == nil {
 		return
 	}
-	fmt.Println("UDPv6 模式下，数据包长度不能小于 2，已自动调整为 2")
-	*packetSize = 2
+	util.SrcDev = dev.Name
+	if srcAddr == nil || strings.TrimSpace(*srcAddr) != "" {
+		return
+	}
+	if resolved := resolveSourceDeviceAddr(dev, dstIP); resolved != "" {
+		*srcAddr = resolved
+	}
 }
 
 func printTraceNav(jsonPrint bool, effectiveMTR bool, ip net.IP, domain, dataOrigin string, maxHops, packetSize int, srcAddr string, method trace.Method) {
@@ -809,6 +917,7 @@ func buildTraceConfig(
 	osType, icmpMode int,
 	dn42 bool,
 	srcAddr string,
+	sourceDevice string,
 	srcPort int,
 	beginHop int,
 	ip net.IP,
@@ -825,6 +934,8 @@ func buildTraceConfig(
 	dataOrigin string,
 	timeout int,
 	packetSize int,
+	randomPacketSize bool,
+	tos int,
 	disableMPLS bool,
 ) trace.Config {
 	return trace.Config{
@@ -833,7 +944,7 @@ func buildTraceConfig(
 		DN42:             dn42,
 		SrcAddr:          srcAddr,
 		SrcPort:          srcPort,
-		SourceDevice:     util.SrcDev,
+		SourceDevice:     strings.TrimSpace(sourceDevice),
 		BeginHop:         beginHop,
 		DstIP:            ip,
 		DstPort:          port,
@@ -849,6 +960,8 @@ func buildTraceConfig(
 		IPGeoSource:      ipgeo.GetSource(dataOrigin),
 		Timeout:          time.Duration(timeout) * time.Millisecond,
 		PktSize:          packetSize,
+		RandomPacketSize: randomPacketSize,
+		TOS:              tos,
 		DisableMPLS:      disableMPLS,
 	}
 }
@@ -892,9 +1005,38 @@ func maybeRunMTRMode(
 	return true
 }
 
-func configureTracePrinters(conf *trace.Config, tablePrint, classicPrint, rawPrint, output bool) {
+func resolveOutputPath(outputPath string, outputDefault bool) (string, error) {
+	trimmed := strings.TrimSpace(outputPath)
+	if trimmed != "" && outputDefault {
+		return "", errors.New("--output 与 --output-default 不能同时使用")
+	}
+	if trimmed != "" {
+		return trimmed, nil
+	}
+	if outputDefault {
+		return tracelog.DefaultPath, nil
+	}
+	return "", nil
+}
+
+func validateJSONRealtimeOutput(jsonPrint bool, outputPath string) error {
+	if jsonPrint && strings.TrimSpace(outputPath) != "" {
+		return errors.New("--json 不能与 --output/--output-default 同时使用")
+	}
+	return nil
+}
+
+func setFastIPOutputSuppression(suppress bool) func() {
+	prev := util.SuppressFastIPOutput
+	util.SuppressFastIPOutput = suppress
+	return func() {
+		util.SuppressFastIPOutput = prev
+	}
+}
+
+func configureTracePrinters(conf *trace.Config, tablePrint, classicPrint, rawPrint bool, outputPath string) (func() error, error) {
 	if tablePrint {
-		return
+		return nil, nil
 	}
 	router := false
 	switch {
@@ -902,14 +1044,20 @@ func configureTracePrinters(conf *trace.Config, tablePrint, classicPrint, rawPri
 		conf.RealtimePrinter = printer.ClassicPrinter
 	case rawPrint:
 		conf.RealtimePrinter = printer.EasyPrinter
-	case output:
-		conf.RealtimePrinter = tracelog.RealtimePrinter
+	case outputPath != "":
+		f, err := tracelog.OpenFile(outputPath)
+		if err != nil {
+			return nil, err
+		}
+		conf.RealtimePrinter = tracelog.NewRealtimePrinter(io.MultiWriter(os.Stdout, f))
+		return f.Close, nil
 	case router:
 		conf.RealtimePrinter = printer.RealtimePrinterWithRouter
 		fmt.Println("路由表数据源由 BGP.Tools 提供，在此特表感谢")
 	default:
 		conf.RealtimePrinter = printer.RealtimePrinter
 	}
+	return nil, nil
 }
 
 func applyJSONOutputMode(conf *trace.Config, jsonPrint bool) {
@@ -941,9 +1089,9 @@ func runTraceOnce(method trace.Method, conf trace.Config) (*trace.Result, bool) 
 	return res, true
 }
 
-func finalizeTraceResult(res *trace.Result, tablePrint, routePath bool, dstIP net.IP, disableMaptrace, jsonPrint bool, dataOrigin string) {
+func finalizeTraceResult(ctx context.Context, res *trace.Result, tablePrint, tableClearScreen, routePath bool, dstIP net.IP, disableMaptrace, jsonPrint bool, dataOrigin string) {
 	if tablePrint {
-		printer.TracerouteTablePrinter(res)
+		printer.TracerouteTablePrinter(res, tableClearScreen)
 	}
 	if routePath {
 		reporter.New(res, dstIP.String()).Print()
@@ -956,7 +1104,7 @@ func finalizeTraceResult(res *trace.Result, tablePrint, routePath bool, dstIP ne
 	}
 	if !disableMaptrace &&
 		(util.StringInSlice(strings.ToUpper(dataOrigin), []string{"LEOMOEAPI", "IPINFO", "IP-API.COM", "IPAPI.COM"})) {
-		url, err := tracemap.GetMapUrl(string(r))
+		url, err := tracemap.GetMapUrlWithContext(ctx, string(r))
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -987,6 +1135,7 @@ func Execute() {
 	ipv6Only := parser.Flag("6", "ipv6", &argparse.Options{Help: "Use IPv6 only"})
 	tcp := parser.Flag("T", "tcp", &argparse.Options{Help: "Use TCP SYN for tracerouting (default dest-port is 80)"})
 	udp := parser.Flag("U", "udp", &argparse.Options{Help: "Use UDP SYN for tracerouting (default dest-port is 33494)"})
+	mtuMode := registerMTUFlag(parser)
 	fastTraceFlag := registerFastTraceFlag(parser)
 	port := parser.Int("p", "port", &argparse.Options{Help: "Set the destination port to use. With default of 80 for \"tcp\", 33494 for \"udp\""})
 	icmpMode := registerICMPModeFlag(parser)
@@ -1002,7 +1151,8 @@ func Execute() {
 	alwaysrDNS := parser.Flag("a", "always-rdns", &argparse.Options{Help: "Always resolve IP addresses to their domain names"})
 	outputFlags := registerTracerouteOutputFlags(parser)
 	routePath := outputFlags.routePath
-	output := outputFlags.output
+	outputPath := outputFlags.outputPath
+	outputDefault := outputFlags.outputDefault
 	tablePrint := outputFlags.tablePrint
 	jsonPrint := outputFlags.jsonPrint
 	classicPrint := outputFlags.classicPrint
@@ -1025,7 +1175,8 @@ func Execute() {
 	packetInterval := registerPacketIntervalFlag(parser)
 	ttlInterval := registerTTLIntervalFlag(parser)
 	timeout := parser.Int("", "timeout", &argparse.Options{Default: 1000, Help: buildTimeoutHelp()})
-	packetSize := parser.Int("", "psize", &argparse.Options{Default: 52, Help: buildPayloadSizeHelp()})
+	packetSize := parser.Int("", "psize", &argparse.Options{Help: buildPayloadSizeHelp()})
+	tos := parser.Int("Q", "tos", &argparse.Options{Default: 0, Help: buildTOSHelp()})
 	dot := parser.Selector("", "dot-server", []string{"dnssb", "aliyun", "dnspod", "google", "cloudflare"}, &argparse.Options{
 		Help: "Use DoT Server for DNS Parse [dnssb, aliyun, dnspod, google, cloudflare]"})
 	lang := parser.Selector("g", "language", []string{"en", "cn"}, &argparse.Options{Default: "cn",
@@ -1047,26 +1198,64 @@ func Execute() {
 	file := registerFileFlag(parser)
 	str := parser.StringPositional(&argparse.Options{Help: "Trace target: IPv4 address (e.g. 8.8.8.8), IPv6 address (e.g. 2001:db8::1), domain name (e.g. example.com), or URL (e.g. https://example.com)"})
 
-	err := parser.Parse(os.Args)
+	err := parser.Parse(normalizeNegativePacketSizeArgs(os.Args))
 	if err != nil {
 		// In case of error print error and print usage
 		// This can also be done by passing -h or --help flags
 		fmt.Print(sanitizeUsagePositionalArgs(parser.Usage(err)))
 		return
 	}
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	util.SrcDev = ""
 
 	mtrModes := deriveEffectiveMTRModes(*mtrMode, *reportMode, *wideMode, *rawPrint)
+	resolvedOutputPath, outputErr := resolveOutputPath(*outputPath, *outputDefault)
+	if outputErr != nil {
+		fmt.Println(outputErr)
+		os.Exit(1)
+	}
+	if err := validateJSONRealtimeOutput(*jsonPrint, resolvedOutputPath); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	if *mtuMode {
+		conflictFlags := buildMTUConflictFlags(
+			*tcp,
+			*rawPrint,
+			mtrModes,
+			*tablePrint,
+			*classicPrint,
+			*routePath,
+			*outputPath != "",
+			*outputDefault,
+			*deploy,
+			enableGlobalping,
+			*from,
+			*file,
+			*fastTraceFlag,
+		)
+		if conflict, ok := checkMTUConflicts(conflictFlags); !ok {
+			fmt.Printf("--mtu 不能与 %s 同时使用\n", conflict)
+			os.Exit(1)
+		}
+		if err := normalizeMTUProtocolFlags(tcp, udp); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+	}
 	if mtrModes.mtr {
 		conflictFlags := map[string]bool{
-			"table":     *tablePrint,
-			"classic":   *classicPrint,
-			"json":      *jsonPrint,
-			"output":    *output,
-			"routePath": *routePath,
-			"from":      enableGlobalping && *from != "",
-			"fastTrace": *fastTraceFlag,
-			"file":      *file != "",
-			"deploy":    enableWebUI && *deploy,
+			"table":         *tablePrint,
+			"classic":       *classicPrint,
+			"json":          *jsonPrint,
+			"output":        *outputPath != "",
+			"outputDefault": *outputDefault,
+			"routePath":     *routePath,
+			"from":          enableGlobalping && *from != "",
+			"fastTrace":     *fastTraceFlag,
+			"file":          *file != "",
+			"deploy":        enableWebUI && *deploy,
 		}
 		if conflict, ok := checkMTRConflicts(conflictFlags); !ok {
 			fmt.Printf("--mtr 不能与 %s 同时使用\n", conflict)
@@ -1074,19 +1263,91 @@ func Execute() {
 		}
 	}
 
-	queriesExplicit, ttlTimeExplicit := detectExplicitProbeFlags(parser)
+	queriesExplicit, ttlTimeExplicit, packetSizeExplicit, tosExplicit := detectExplicitProbeFlags(parser)
 	applyTTLIntervalDefault(ttlInterval, ttlTimeExplicit, mtrModes.mtr)
 	osType := resolveOSType()
+	stdoutIsTTY := CheckTTY(int(os.Stdout.Fd()))
+	if shouldForceNoColorForMTUNonTTY(*mtuMode, *jsonPrint, stdoutIsTTY) {
+		*noColor = true
+	}
 	if handleStartupModes(*noColor, *jsonPrint, mtrModes, *ver, *deploy, *deployListen, *init, osType) {
 		return
+	}
+	restoreFastIPOutput := setFastIPOutputSuppression(*jsonPrint || mtrModes.mtr)
+	defer restoreFastIPOutput()
+
+	if *tos < 0 || *tos > 255 {
+		fmt.Println("--tos 必须在 0-255 之间")
+		os.Exit(1)
 	}
 
 	applyDefaultPort(port, *udp)
 	clampProbeSettings(*tcp, numMeasurements, maxAttempts)
 	configureGeoDNS(*dot)
 
+	if *mtuMode {
+		if packetSizeExplicit {
+			fmt.Println("--mtu 不支持 --psize")
+			os.Exit(1)
+		}
+		if tosExplicit {
+			fmt.Println("--mtu 不支持 --tos")
+			os.Exit(1)
+		}
+		if !checkRuntimePrivileges(true) {
+			os.Exit(1)
+		}
+		domain := resolveCLITargetOrExit(*str, sanitizeUsagePositionalArgs(parser.Usage(err)))
+		if domain == "" {
+			return
+		}
+		ip := lookupTargetIPOrExit(rootCtx, domain, *ipv4Only, *ipv6Only, *dot, *jsonPrint)
+		resolvedSrcAddr, explicitSrc, srcResolveErr := resolveConfiguredSrcAddr(ip, *srcAddr, *srcDev)
+		if srcResolveErr != nil {
+			fmt.Println(srcResolveErr)
+			os.Exit(1)
+		}
+		if !explicitSrc {
+			applySourceDevice(*srcDev, ip, srcAddr)
+		}
+		if strings.TrimSpace(*srcAddr) == "" {
+			*srcAddr = resolvedSrcAddr
+		}
+		srcIP, srcErr := resolveMTUSourceIP(ip, resolvedSrcAddr)
+		if srcErr != nil {
+			fmt.Println(srcErr)
+			os.Exit(1)
+		}
+		leoWs := prepareRuntimeEnvironment(rootCtx, *dn42, dataOrigin, disableMaptrace, powProvider)
+		defer closeLeoWebsocket(leoWs)
+		conf := buildMTUTraceConfig(
+			domain,
+			ip,
+			srcIP,
+			*srcDev,
+			*srcPort,
+			*port,
+			*beginHop,
+			*maxHops,
+			*numMeasurements,
+			*timeout,
+			*ttlInterval,
+			!*norDNS,
+			*alwaysrDNS,
+			ipgeo.GetSource(*dataOrigin),
+			*lang,
+		)
+		if err := runStandaloneMTUMode(conf, *jsonPrint); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				fmt.Println(err)
+			}
+		}
+		return
+	}
+
 	method := resolveTraceMethod(*tcp, *udp)
 	paramsFastTrace := fastTrace.ParamsFastTrace{
+		Context:        rootCtx,
 		OSType:         osType,
 		ICMPMode:       *icmpMode,
 		SrcDev:         *srcDev,
@@ -1099,11 +1360,14 @@ func Execute() {
 		AlwaysWaitRDNS: *alwaysrDNS,
 		Lang:           *lang,
 		PktSize:        *packetSize,
+		PacketSizeSet:  packetSizeExplicit,
+		TOS:            *tos,
 		Timeout:        time.Duration(*timeout) * time.Millisecond,
 		File:           *file,
 		Dot:            *dot,
+		OutputPath:     resolvedOutputPath,
 	}
-	if maybeRunFastTraceMode(*from, *fastTraceFlag, *file, paramsFastTrace, method, *output) {
+	if maybeRunFastTraceMode(*from, *fastTraceFlag, *file, paramsFastTrace, method) {
 		return
 	}
 
@@ -1112,8 +1376,19 @@ func Execute() {
 		return
 	}
 
-	leoWs := prepareRuntimeEnvironment(mtrModes, *dn42, dataOrigin, disableMaptrace, powProvider)
+	leoWs := prepareRuntimeEnvironment(rootCtx, *dn42, dataOrigin, disableMaptrace, powProvider)
 	defer closeLeoWebsocket(leoWs)
+
+	if *from != "" {
+		if packetSizeExplicit {
+			fmt.Println("Globalping 模式不支持 --psize")
+			os.Exit(1)
+		}
+		if tosExplicit {
+			fmt.Println("Globalping 模式不支持 --tos")
+			os.Exit(1)
+		}
+	}
 
 	if maybeHandleGlobalping(
 		*from,
@@ -1135,8 +1410,10 @@ func Execute() {
 			ClassicPrint: *classicPrint,
 			RawPrint:     *rawPrint,
 			JSONPrint:    *jsonPrint,
+			ClearScreen:  stdoutIsTTY,
 		},
 		&trace.Config{
+			Context:         rootCtx,
 			OSType:          osType,
 			DN42:            *dn42,
 			NumMeasurements: *numMeasurements,
@@ -1150,11 +1427,27 @@ func Execute() {
 		return
 	}
 
-	ip := lookupTargetIPOrExit(domain, *ipv4Only, *ipv6Only, *dot, *jsonPrint)
+	ip := lookupTargetIPOrExit(rootCtx, domain, *ipv4Only, *ipv6Only, *dot, *jsonPrint)
 
-	applySourceDevice(*srcDev, ip, srcAddr)
-	normalizeUDPPacketSize(*udp, ip, packetSize)
-	printTraceNav(*jsonPrint, mtrModes.mtr, ip, domain, *dataOrigin, *maxHops, *packetSize, *srcAddr, method)
+	resolvedSrcAddr, explicitSrc, srcResolveErr := resolveConfiguredSrcAddr(ip, *srcAddr, *srcDev)
+	if srcResolveErr != nil {
+		fmt.Println(srcResolveErr)
+		os.Exit(1)
+	}
+	if !explicitSrc {
+		applySourceDevice(*srcDev, ip, srcAddr)
+	}
+	if strings.TrimSpace(*srcAddr) == "" {
+		*srcAddr = resolvedSrcAddr
+	}
+	effectivePacketSize := resolvePacketSizeArg(*packetSize, packetSizeExplicit, method, ip)
+	printTraceNav(*jsonPrint, mtrModes.mtr, ip, domain, *dataOrigin, *maxHops, effectivePacketSize, resolvedSrcAddr, method)
+
+	packetSizeSpec, packetSizeErr := trace.NormalizePacketSize(method, ip, effectivePacketSize)
+	if packetSizeErr != nil {
+		fmt.Println(packetSizeErr)
+		os.Exit(1)
+	}
 
 	util.SrcPort = *srcPort
 	util.DstIP = ip.String()
@@ -1162,7 +1455,8 @@ func Execute() {
 		osType,
 		*icmpMode,
 		*dn42,
-		*srcAddr,
+		resolvedSrcAddr,
+		*srcDev,
 		*srcPort,
 		*beginHop,
 		ip,
@@ -1178,15 +1472,29 @@ func Execute() {
 		*alwaysrDNS,
 		*dataOrigin,
 		*timeout,
-		*packetSize,
+		packetSizeSpec.PayloadSize,
+		packetSizeSpec.Random,
+		*tos,
 		*disableMPLS,
 	)
+	conf.Context = rootCtx
 
 	if maybeRunMTRMode(mtrModes, method, conf, queriesExplicit, *numMeasurements, ttlTimeExplicit, *ttlInterval, domain, *dataOrigin, *showIPs, *ipInfoMode) {
 		return
 	}
 
-	configureTracePrinters(&conf, *tablePrint, *classicPrint, *rawPrint, *output)
+	outputCleanup, err := configureTracePrinters(&conf, *tablePrint, *classicPrint, *rawPrint, resolvedOutputPath)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	if outputCleanup != nil {
+		defer func() {
+			if closeErr := outputCleanup(); closeErr != nil {
+				fmt.Println(closeErr)
+			}
+		}()
+	}
 	applyJSONOutputMode(&conf, *jsonPrint)
 	maybeRunUninterruptedRaw(*rawPrint, method, conf)
 
@@ -1195,7 +1503,7 @@ func Execute() {
 		return
 	}
 
-	finalizeTraceResult(res, *tablePrint, *routePath, ip, *disableMaptrace, *jsonPrint, *dataOrigin)
+	finalizeTraceResult(rootCtx, res, *tablePrint, stdoutIsTTY, *routePath, ip, *disableMaptrace, *jsonPrint, *dataOrigin)
 }
 
 type mtrRunMode int
@@ -1266,54 +1574,16 @@ func deriveMTRRoundParams(effectiveReport, queriesExplicit bool, numMeasurements
 }
 
 func capabilitiesCheck() {
-	// Windows 判断放在前面，防止遇到一些奇奇怪怪的问题
-	if runtime.GOOS == "windows" {
-		// Running on Windows, skip checking capabilities
-		return
+	status := util.TracePrivilegeStatus(appBinName, false)
+	if status.Message != "" {
+		fmt.Println(status.Message)
 	}
+}
 
-	uid := os.Getuid()
-	if uid == 0 {
-		// Running as root, skip checking capabilities
-		return
+func checkRuntimePrivileges(requireWindowsAdmin bool) bool {
+	status := util.TracePrivilegeStatus(appBinName, requireWindowsAdmin)
+	if status.Message != "" {
+		fmt.Println(status.Message)
 	}
-
-	/***
-	* 检查当前进程是否有两个关键的权限
-	==== 看不到我 ====
-	* 没办法啦
-	* 自己之前承诺的坑补全篇
-	* 被迫填坑系列 qwq
-	==== 看不到我 ====
-	***/
-
-	// NewPid 已经被废弃了，这里改用 NewPid2 方法
-	caps, err := capability.NewPid2(0)
-	if err != nil {
-		// 判断是否为macOS
-		if runtime.GOOS == "darwin" {
-			// macOS下报错有问题
-		} else {
-			fmt.Println(err)
-		}
-		return
-	}
-
-	// load 获取全部的 caps 信息
-	err = caps.Load()
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	// 判断一下权限有木有
-	if caps.Get(capability.EFFECTIVE, capability.CAP_NET_RAW) && caps.Get(capability.EFFECTIVE, capability.CAP_NET_ADMIN) {
-		// 有权限啦
-		return
-	} else {
-		// 没权限啦
-		fmt.Println("您正在以普通用户权限运行 NextTrace，但 NextTrace 未被赋予监听网络套接字的ICMP消息包、修改IP头信息（TTL）等路由跟踪所需的权限")
-		fmt.Printf("请使用管理员用户执行 `sudo setcap cap_net_raw,cap_net_admin+eip ${your_nexttrace_path}/%s` 命令，赋予相关权限后再运行~\n", appBinName)
-		fmt.Println("什么？为什么 ping 普通用户执行不要 root 权限？因为这些工具在管理员安装时就已经被赋予了一些必要的权限，具体请使用 `getcap /usr/bin/ping` 查看")
-	}
+	return !status.Fatal
 }

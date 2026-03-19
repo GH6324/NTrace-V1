@@ -154,6 +154,7 @@ Starting from this release, NextTrace is published in **three flavors** under th
 | Feature               | `nexttrace` (Full) | `nexttrace-tiny` |    `ntr`     |
 | --------------------- | :----------------: | :--------------: | :----------: |
 | Normal traceroute     |         ✅         |        ✅        |      —       |
+| Standalone MTU (`--mtu`) |      ✅         |        ✅        |      —       |
 | MTR TUI               |         ✅         |        —         | ✅ (default) |
 | MTR report (`-r`)     |         ✅         |        —         |      ✅      |
 | MTR wide (`-w`)       |         ✅         |        —         |      ✅      |
@@ -170,7 +171,7 @@ Starting from this release, NextTrace is published in **three flavors** under th
 
 - **`nexttrace`** — Full-featured build. Includes everything: traceroute, MTR, Globalping, and WebUI.
 - **`nexttrace-tiny`** — Lightweight build. Normal traceroute only, no MTR / Globalping / WebUI. Suitable for embedded or minimal environments.
-- **`ntr`** — MTR-focused build. Runs MTR TUI by default. No Globalping / WebUI; no normal traceroute mode.
+- **`ntr`** — MTR-focused build. Runs MTR TUI by default. No Globalping / WebUI; no normal traceroute mode and no standalone `--mtu` mode.
 
 ### Manual Build
 
@@ -233,9 +234,15 @@ nexttrace http://example.com:8080/index.html?q=1
 # Table output (report mode): runs trace once and prints a final summary table
 nexttrace --table 1.0.0.1
 
-# An Output Easy to Parse
+# Machine-readable output: stdout is a single JSON document
 nexttrace --raw 1.0.0.1
 nexttrace --json 1.0.0.1
+
+# Realtime trace output to a custom file
+nexttrace --output ./trace.log 1.0.0.1
+
+# Realtime trace output to the default log file
+nexttrace --output-default 1.0.0.1
 
 # IPv4/IPv6 Resolve Only, and automatically select the first IP when there are multiple IPs
 nexttrace --ipv4 g.co
@@ -273,6 +280,7 @@ The routing visualization function requires the geographical coordinates of each
 - **For Administrator Mode:**  
   **TCP/UDP mode** requires `WinDivert`.  
   **ICMP mode** supports `1=Socket` and `2=WinDivert` (`0=Auto`). If running in Socket mode, the firewall must allow `ICMP/ICMPv6`.  
+  On `Windows`, `ICMPv6` without `--tos` (or with `--tos 0`) keeps using the native Socket send path. A non-zero `ICMPv6 --tos` requires `WinDivert` send support in addition to administrator privilege.  
   `WinDivert` can be automatically configured using the `--init` parameter.
 
 #### `NextTrace` now supports quick testing, and friends who have a one-time backhaul routing test requirement can use it
@@ -327,6 +335,24 @@ nexttrace --udp --port 5353 1.0.0.1
 nexttrace --tcp --source-port 14514 www.bing.com
 ```
 
+#### `NextTrace` also supports standalone path-MTU discovery mode
+
+```bash
+# Tracepath-style UDP PMTU discovery with live hop output
+nexttrace --mtu 1.1.1.1
+
+# Reuse the normal GeoIP / RDNS knobs in mtu mode
+nexttrace --mtu --data-provider IPInfo --language en 1.1.1.1
+
+# JSON output keeps the standalone mtu schema and now includes hop.geo
+nexttrace --mtu --json 1.1.1.1
+```
+
+- `--mtu` is an independent UDP-only mode. It does not reuse the normal traceroute engine.
+- TTY output updates the current hop in place and adds color for hop state / PMTU highlights; redirected / piped output falls back to finalized line-by-line streaming without ANSI.
+- `--mtu --json` prints only the standalone MTU JSON document on stdout.
+- GeoIP, RDNS, `--data-provider`, `--language`, `--no-rdns`, `--always-rdns`, and `--dot-server` all apply to this mode.
+
 #### `NextTrace` also supports some advanced functions, such as ttl control, concurrent probe packet count control, mode switching, etc.
 
 ```bash
@@ -350,8 +376,14 @@ export NEXTTRACE_ENABLEHIDDENDSTIP=1
 # Turn off the IP reverse parsing function
 nexttrace --no-rdns www.bbix.net
 
-# Set the payload size to 1024 bytes
+# Set the probe packet size to 1024 bytes (inclusive IP + probe headers)
 nexttrace --psize 1024 example.com
+
+# Randomize each probe packet size up to 1500 bytes
+nexttrace --psize -1500 example.com
+
+# Set the TOS / traffic class field
+nexttrace -Q 46 example.com
 
 # Feature: print Route-Path diagram
 # Route-Path diagram example:
@@ -380,7 +412,8 @@ export NO_COLOR=1
 | `--send-time` | Gap between packets inside one TTL group | `50ms` | Raise to `100-200ms` on rate-limited devices; ignored in MTR |
 | `--ttl-time` | Gap between TTL groups in traceroute; per-hop interval in MTR | traceroute: `300ms`; MTR: `1000ms` when omitted | Lower to speed up; raise on remote/rate-limited paths |
 | `--timeout` | Per-probe timeout | `1000ms` | Raise to `2000-3000ms` for intercontinental or high-loss paths |
-| `--psize` | Payload size | `52` bytes | Raise only for MTU or large-packet testing |
+| `--psize` | Probe packet size | Protocol/IP-family minimum | Inclusive IP + probe headers; negative values randomize each probe up to `abs(value)`; sizes above the egress/path MTU may fragment on wire |
+| `-Q`, `--tos` | IP TOS / traffic class | `0` | Set DSCP/TOS style marking in the IP header; on Windows only `ICMPv6` with a non-zero value requires `WinDivert` |
 
 These probe knobs are CLI-only today; `nt_config.yaml` does not yet store them. If you want reusable profiles, keep them in shell aliases or small wrapper scripts.
 
@@ -497,7 +530,7 @@ In MTR mode (`--mtr`, `-r`, `-w`, including `--raw`), `-i/--ttl-time` sets the *
 
 > Note: `--show-ips` only takes effect in MTR mode (`--mtr`, `-r`, `-w`); otherwise it is ignored.
 >
-> Note: `--mtr` cannot be used together with `--table`, `--classic`, `--json`, `--output`, `--route-path`, `--from`, `--fast-trace`, `--file`, or `--deploy`.
+> Note: `--mtr` cannot be used together with `--table`, `--classic`, `--json`, `--output`, `--output-default`, `--route-path`, `--from`, `--fast-trace`, `--file`, or `--deploy`.
 
 #### `NextTrace` supports users to select their own IP API (currently supports: `LeoMoeAPI`, `IP.SB`, `IPInfo`, `IPInsight`, `IPAPI.com`, `IPInfoLocal`, `CHUNZHEN`)
 
@@ -626,9 +659,10 @@ Usage: nexttrace [-h|--help] [--init] [-4|--ipv4] [-6|--ipv6] [-T|--tcp]
                  [-m|--max-hops <integer>] [-d|--data-provider
                  (IP.SB|ip.sb|IPInfo|ipinfo|IPInsight|ipinsight|IPAPI.com|ip-api.com|IPInfoLocal|ipinfolocal|chunzhen|LeoMoeAPI|leomoeapi|ipdb.one|disable-geoip)]
                  [--pow-provider (api.nxtrace.org|sakura)] [-n|--no-rdns]
-                 [-a|--always-rdns] [-P|--route-path] [--dn42] [-o|--output]
-                 [--table] [--raw] [-j|--json] [-c|--classic] [-f|--first
-                 <integer>] [-M|--map] [-e|--disable-mpls] [-V|--version]
+                 [-a|--always-rdns] [-P|--route-path] [--dn42] [-o|--output
+                 "<value>"] [-O|--output-default] [--table] [--raw]
+                 [-j|--json] [-c|--classic] [-f|--first <integer>] [-M|--map]
+                 [-e|--disable-mpls] [-V|--version]
                  [-s|--source "<value>"] [--source-port <integer>] [-D|--dev
                  "<value>"] [--listen "<value>"] [--deploy] [-z|--send-time
                  <integer>] [-i|--ttl-time <integer>] [--timeout <integer>]
@@ -682,8 +716,10 @@ Arguments:
   -P  --route-path                   Print traceroute hop path by ASN and
                                      location
       --dn42                         DN42 Mode
-  -o  --output                       Write trace result to file
-                                     (RealTimePrinter ONLY)
+  -o  --output                       Write trace result to FILE
+                                     (RealtimePrinter only)
+  -O  --output-default               Write trace result to the default log file
+                                     (/tmp/trace.log)
       --table                        Output trace results as a final summary
                                      table (traceroute report mode)
       --raw                          Machine-friendly output. With MTR
@@ -718,9 +754,14 @@ Arguments:
       --timeout                      Per-probe timeout [ms]. Raise to 2000-3000
                                      on slow intercontinental or high-loss
                                      paths. Default: 1000
-      --psize                        Payload size in bytes. Keep 52 for normal
-                                     routing checks; raise only for MTU or
-                                     large-packet testing. Default: 52
+      --psize                        Probe packet size in bytes, inclusive IP
+                                     and active probe headers. Default is the
+                                     minimum legal size for the chosen
+                                     protocol and IP family; raise for MTU or
+                                     large-packet testing. Negative values
+                                     randomize each probe up to abs(value).
+  -Q  --tos                          Set the IP type-of-service / traffic class
+                                     value [0-255]. Default: 0
       --dot-server                   Use DoT Server for DNS Parse [dnssb,
                                      aliyun, dnspod, google, cloudflare]
   -g  --language                     Choose the language for displaying [en,

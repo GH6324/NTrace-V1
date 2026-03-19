@@ -10,14 +10,13 @@ import (
 	"net"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/nxtrace/NTrace-core/util"
 	wd "github.com/xjasonlyu/windivert-go"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/windows"
 )
 
 type ICMPSpec struct {
@@ -29,6 +28,8 @@ type ICMPSpec struct {
 	icmp         net.PacketConn
 	icmp4        *ipv4.PacketConn
 	icmp6        *ipv6.PacketConn
+	sendHandle   wd.Handle
+	sendAddr     wd.Address
 	hopLimitLock sync.Mutex
 }
 
@@ -38,41 +39,16 @@ func ListenPacket(network string, laddr string) (net.PacketConn, error) {
 
 func (s *ICMPSpec) Close() {
 	_ = s.icmp.Close()
-}
-
-// isAdmin 判断当前进程是否具有管理员权限
-func isAdmin() bool {
-	var token windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
-		return false
+	if s.sendHandle != 0 {
+		_ = s.sendHandle.Close()
 	}
-	defer func() {
-		_ = token.Close()
-	}()
-
-	type tokenElevation struct {
-		TokenIsElevated uint32
-	}
-	var elev tokenElevation
-	var outLen uint32
-
-	if err := windows.GetTokenInformation(
-		token,
-		windows.TokenElevation,
-		(*byte)(unsafe.Pointer(&elev)),
-		uint32(unsafe.Sizeof(elev)),
-		&outLen,
-	); err != nil {
-		return false
-	}
-	return elev.TokenIsElevated != 0
 }
 
 // winDivertAvailable 通过尝试打开一个 WinDivert 嗅探 handle 来判断 WinDivert 是否可用
 func winDivertAvailable() (bool, error) {
 	h, err := wd.Open("false", wd.LayerNetwork, 0, wd.FlagSniff|wd.FlagRecvOnly)
 	if err != nil {
-		return false, fmt.Errorf("WinDivert not available: %v", err)
+		return false, fmt.Errorf("WinDivert 不可用: %v", err)
 	}
 	_ = h.Close()
 	return true, nil
@@ -92,9 +68,9 @@ func (s *ICMPSpec) resolveICMPMode() int {
 	}
 
 	// Auto(0) 或强制 Sniff(2) → 尝试 WinDivert
-	if !isAdmin() {
+	if !util.HasAdminPrivileges() {
 		if icmpMode == 2 {
-			log.Printf("WinDivert sniff mode requested, but administrator privilege is required; falling back to Socket mode.")
+			log.Printf("请求使用 WinDivert 嗅探模式，但当前缺少管理员权限；已回退到 Socket 模式。")
 		}
 		return 1
 	}
@@ -102,7 +78,7 @@ func (s *ICMPSpec) resolveICMPMode() int {
 	ok, err := winDivertAvailable()
 	if !ok {
 		if icmpMode == 2 {
-			log.Printf("WinDivert sniff mode requested, but WinDivert is not available: %v; falling back to Socket mode.", err)
+			log.Printf("请求使用 WinDivert 嗅探模式，但 WinDivert 不可用: %v；已回退到 Socket 模式。", err)
 		}
 		return 1
 	}
@@ -185,6 +161,9 @@ func (s *ICMPSpec) SendICMP(ctx context.Context, ipHdr gopacket.NetworkLayer, ic
 		s.hopLimitLock.Lock()
 		defer s.hopLimitLock.Unlock()
 
+		if err := s.icmp4.SetTOS(int(ip4.TOS)); err != nil {
+			return time.Time{}, err
+		}
 		if err := s.icmp4.SetTTL(ttl); err != nil {
 			return time.Time{}, err
 		}
@@ -212,13 +191,17 @@ func (s *ICMPSpec) SendICMP(ctx context.Context, ipHdr gopacket.NetworkLayer, ic
 		return time.Time{}, fmt.Errorf("SetNetworkLayerForChecksum: %w", err)
 	}
 
+	if shouldUseICMPv6RawSend(ip6) {
+		return s.sendICMPv6WithWinDivert(ip6, icmpHdr, icmpEcho, payload)
+	}
+
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
 		ComputeChecksums: true,
 		FixLengths:       true,
 	}
 
-	// 序列化 ICMP 头与 payload 到缓冲区
+	// Socket path only needs the ICMPv6 payload; the kernel prepends the IPv6 header.
 	if err := gopacket.SerializeLayers(buf, opts, icmpHdr, icmpEcho, gopacket.Payload(payload)); err != nil {
 		return time.Time{}, err
 	}
@@ -237,4 +220,55 @@ func (s *ICMPSpec) SendICMP(ctx context.Context, ipHdr gopacket.NetworkLayer, ic
 		return time.Time{}, err
 	}
 	return start, nil
+}
+
+func shouldUseICMPv6RawSend(ip6 *layers.IPv6) bool {
+	return ip6 != nil && ip6.TrafficClass != 0
+}
+
+func (s *ICMPSpec) sendICMPv6WithWinDivert(ip6 *layers.IPv6, icmpHdr, icmpEcho gopacket.SerializableLayer, payload []byte) (time.Time, error) {
+	s.hopLimitLock.Lock()
+	defer s.hopLimitLock.Unlock()
+
+	if err := s.ensureICMPSendHandle(true); err != nil {
+		return time.Time{}, err
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+	if err := gopacket.SerializeLayers(buf, opts, ip6, icmpHdr, icmpEcho, gopacket.Payload(payload)); err != nil {
+		return time.Time{}, err
+	}
+
+	start := time.Now()
+	if _, err := s.sendHandle.Send(buf.Bytes(), &s.sendAddr); err != nil {
+		return time.Time{}, err
+	}
+	return start, nil
+}
+
+func (s *ICMPSpec) ensureICMPSendHandle(ipv6 bool) error {
+	if s.sendHandle != 0 {
+		return nil
+	}
+
+	handle, err := wd.Open("false", wd.LayerNetwork, 0, 0)
+	if err != nil {
+		if ipv6 {
+			return fmt.Errorf("ICMPv6 --tos on Windows requires WinDivert send support: %w", err)
+		}
+		return err
+	}
+
+	s.sendHandle = handle
+	s.sendAddr.SetLayer(wd.LayerNetwork)
+	s.sendAddr.SetEvent(wd.EventNetworkPacket)
+	s.sendAddr.SetOutbound()
+	if ipv6 {
+		s.sendAddr.SetIPv6()
+	}
+	return nil
 }
